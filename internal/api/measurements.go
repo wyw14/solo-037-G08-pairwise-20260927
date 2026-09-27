@@ -11,18 +11,24 @@ import (
 )
 
 type MeasurementService interface {
-	CreateMeasuredRun(name, modelName, section, carriage string) (service.MeasuredRun, error)
+	CreateMeasuredRun(name, modelName, section, carriage, modelEntity string) (service.MeasuredRun, error)
 	RecordMeasurement(model.RunID, service.MeasurementInput) (model.Evidence, error)
 	MeasuredRuns() []service.MeasuredRun
 	MeasuredRun(model.RunID) (service.MeasuredRun, bool)
+	CloseMeasuredRun(model.RunID, string) (service.MeasuredRun, error)
 	AnalyzeMeasuredRun(model.RunID) (service.MeasurementAnalysis, error)
 }
 
 type createMeasuredRunRequest struct {
-	Name      string `json:"name"`
-	ModelName string `json:"model_name"`
-	Section   string `json:"section"`
-	Carriage  string `json:"carriage"`
+	Name        string `json:"name"`
+	ModelName   string `json:"model_name"`
+	Section     string `json:"section"`
+	Carriage    string `json:"carriage"`
+	ModelEntity string `json:"model_entity"`
+}
+
+type closeMeasuredRunRequest struct {
+	Outcome string `json:"outcome"`
 }
 
 func decodeMeasurementBody(request *http.Request, value any) error {
@@ -51,9 +57,9 @@ func (r *Router) createMeasuredRun(w http.ResponseWriter, request *http.Request)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	value, err := r.dependencies.CreateMeasuredRun(input.Name, input.ModelName, input.Section, input.Carriage)
+	value, err := r.dependencies.CreateMeasuredRun(input.Name, input.ModelName, input.Section, input.Carriage, input.ModelEntity)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeServiceError(w, err)
 		return
 	}
 	writeJSON(w, value)
@@ -86,6 +92,20 @@ func (r *Router) measurementAnalysis(w http.ResponseWriter, request *http.Reques
 	value, err := r.dependencies.AnalyzeMeasuredRun(model.RunID(chi.URLParam(request, "id")))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, value)
+}
+
+func (r *Router) closeMeasuredRun(w http.ResponseWriter, request *http.Request) {
+	var input closeMeasuredRunRequest
+	if err := decodeMeasurementBody(request, &input); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	value, err := r.dependencies.CloseMeasuredRun(model.RunID(chi.URLParam(request, "id")), input.Outcome)
+	if err != nil {
+		writeServiceError(w, err)
 		return
 	}
 	writeJSON(w, value)

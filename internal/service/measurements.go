@@ -19,8 +19,9 @@ import (
 // MeasuredRun contains observations supplied by an operator, unlike the
 // deterministic diagnostic scenario used by the legacy equipment page.
 type MeasuredRun struct {
-	Operation model.Operation  `json:"operation"`
-	Evidence  []model.Evidence `json:"evidence"`
+	Operation   model.Operation  `json:"operation"`
+	ModelEntity string           `json:"model_entity,omitempty"`
+	Evidence    []model.Evidence `json:"evidence"`
 }
 
 type MeasurementInput struct {
@@ -104,14 +105,14 @@ func (a *MeasurementArchive) commit(next map[model.RunID]MeasuredRun) error {
 	return nil
 }
 
-func (a *MeasurementArchive) Create(name, modelName, section, carriage string) (MeasuredRun, error) {
+func (a *MeasurementArchive) Create(name, modelName, section, carriage, modelEntity string) (MeasuredRun, error) {
 	if strings.TrimSpace(name) == "" || strings.TrimSpace(modelName) == "" || strings.TrimSpace(section) == "" || strings.TrimSpace(carriage) == "" {
 		return MeasuredRun{}, errors.New("name, model, section and carriage are required")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	operation := model.NewOperation(name, modelName, section, carriage, time.Now().UTC())
-	value := MeasuredRun{Operation: operation, Evidence: []model.Evidence{}}
+	value := MeasuredRun{Operation: operation, ModelEntity: modelEntity, Evidence: []model.Evidence{}}
 	next := make(map[model.RunID]MeasuredRun, len(a.runs)+1)
 	for id, run := range a.runs {
 		next[id] = run
@@ -157,6 +158,51 @@ func (a *MeasurementArchive) Get(id model.RunID) (MeasuredRun, bool) {
 	return cloneMeasuredRun(run), exists
 }
 
+// RunActive reports whether the run exists and has not reached a terminal
+// stage. It implements the RunActivity interface used by the custody ledger.
+func (a *MeasurementArchive) RunActive(id model.RunID) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	run, exists := a.runs[id]
+	return exists && run.Operation.Active()
+}
+
+// ErrRunNotFound marks references to an unknown measured run.
+var ErrRunNotFound = errors.New("run not found")
+
+// Close marks a run as complete or aborted, releasing the ship model it
+// occupies. Outcome must be "complete" or "abort".
+func (a *MeasurementArchive) Close(id model.RunID, outcome string) (MeasuredRun, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	run, exists := a.runs[id]
+	if !exists {
+		return MeasuredRun{}, ErrRunNotFound
+	}
+	if !run.Operation.Active() {
+		return MeasuredRun{}, errors.New("run already closed")
+	}
+	now := time.Now().UTC()
+	switch outcome {
+	case "complete":
+		run.Operation.Stage = model.StageComplete
+		run.Operation.UpdatedAt = now
+	case "abort":
+		run.Operation = run.Operation.Abort(now)
+	default:
+		return MeasuredRun{}, errors.New("outcome must be complete or abort")
+	}
+	next := make(map[model.RunID]MeasuredRun, len(a.runs))
+	for key, value := range a.runs {
+		next[key] = value
+	}
+	next[id] = run
+	if err := a.commit(next); err != nil {
+		return MeasuredRun{}, err
+	}
+	return cloneMeasuredRun(run), nil
+}
+
 func (a *MeasurementArchive) List() []MeasuredRun {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -190,8 +236,28 @@ func (a *MeasurementArchive) Analyze(id model.RunID) (MeasurementAnalysis, error
 	return result, nil
 }
 
-func (r *Runtime) CreateMeasuredRun(name, modelName, section, carriage string) (MeasuredRun, error) {
-	return r.Measurements.Create(name, modelName, section, carriage)
+// ErrModelOccupied marks conflicts where a ship model cannot be assigned to a
+// new run because an unconfirmed handover or another active run occupies it.
+var ErrModelOccupied = errors.New("ship model occupied")
+
+// CreateMeasuredRun registers a run, optionally bound to a ship model entity
+// number. A bound model must be registered, have no unconfirmed handover and
+// not be occupied by another active run.
+func (r *Runtime) CreateMeasuredRun(name, modelName, section, carriage, modelEntity string) (MeasuredRun, error) {
+	if modelEntity != "" {
+		if _, ok := r.Custody.Model(modelEntity); !ok {
+			return MeasuredRun{}, fmt.Errorf("%w: %q", ErrShipModelNotFound, modelEntity)
+		}
+		if pending, ok := r.Custody.PendingFor(modelEntity); ok {
+			return MeasuredRun{}, fmt.Errorf("%w: handover %s of ship model %s awaits confirmation", ErrModelOccupied, pending.ID, modelEntity)
+		}
+		for _, run := range r.Measurements.List() {
+			if run.ModelEntity == modelEntity && run.Operation.Active() {
+				return MeasuredRun{}, fmt.Errorf("%w: ship model %s is assigned to active run %s", ErrModelOccupied, modelEntity, run.Operation.ID)
+			}
+		}
+	}
+	return r.Measurements.Create(name, modelName, section, carriage, modelEntity)
 }
 
 func (r *Runtime) RecordMeasurement(id model.RunID, input MeasurementInput) (model.Evidence, error) {
@@ -201,6 +267,10 @@ func (r *Runtime) RecordMeasurement(id model.RunID, input MeasurementInput) (mod
 func (r *Runtime) MeasuredRuns() []MeasuredRun { return r.Measurements.List() }
 
 func (r *Runtime) MeasuredRun(id model.RunID) (MeasuredRun, bool) { return r.Measurements.Get(id) }
+
+func (r *Runtime) CloseMeasuredRun(id model.RunID, outcome string) (MeasuredRun, error) {
+	return r.Measurements.Close(id, outcome)
+}
 
 func (r *Runtime) AnalyzeMeasuredRun(id model.RunID) (MeasurementAnalysis, error) {
 	return r.Measurements.Analyze(id)
